@@ -1,0 +1,111 @@
+
+.pio_version 0
+
+/*
+
+This PIO code emulates simple static RAM read/write behavior.
+We watch the state of the control pins,
+triggering a read when both /CS and /R are low,
+and a write when both /CS and /W are low.
+
+For writing we simply wait for a rising edge on /W
+and send the current address and data to the CPU
+to store.  For reading the address present
+when detecting the falling edge is sent to the CPU
+which reads the data value and returns it to the PIO.
+The data value is written on the output pins until a
+rising /R edge is seen.
+
+We use some trickery to break up the code in blocks of
+four instructions which we can index directly by
+the five bits (/CS, /W, /R, 0, 1) as shown in the README.
+This also has the advantage of allowing us to read
+the entire pin state atomically, making the code
+faster and easier to reason about.
+*/
+
+; control pin offsets from in_base
+
+.define _CS 4
+.define _WR 3
+.define _RD 2
+; input 1 is LED, always 0
+; input 0 is VBUS, always 1 when powered by USB
+
+.program eeprom
+
+.in 32 left             ; no auto-push/pull
+.out 8 right
+
+    .origin 0
+        nop             ; if not powered by USB, remove this NOP
+
+public poll:            ; offset 00001 => /CS = 0, /W = 0, /R = 0
+        in pins, 32     ; fetch pin state, with low five bits /CS, /WR, /RD, 0, 1
+        mov pc, isr     ; jump to poll/read/write/noop (offset 4 x state + 1)
+        nop
+        nop
+
+write:                  ; offset 00101 => /CS = 0, /W = 0, /R = 1
+        wait 1 pin, _WR ; wait for rising edge to commit
+        in pins, 32     ; fetch pin state for data pins
+        push block      ; send adr and data to CPU for writing
+        jmp poll
+
+read:                   ; offset 01000 => /CS = 0, /W = 1, /R = 0
+        push            ; send address to fetch data
+        mov osr, ~null
+        out pindirs,8   ; switch pins to outputs
+        jmp read2
+
+skip011:                ; offset 01100
+        jmp poll
+read2:
+        pull block      ; stall to fetch value from CPU
+        out pins,8      ; put value on pins
+        jmp read3
+
+skip100:                ; offset 10000
+        jmp poll
+        nop
+read3:
+        wait 1 pin, _RD ; wait for rising edge
+        out pindirs,8   ; switch data pins back to inputs (high bits of value are zero))
+        ; fall thru
+
+skip101:                ; offset 10000
+        jmp poll
+        nop
+        nop
+        nop
+
+skip110:                ; offset 10000
+        jmp poll
+        nop
+        nop
+        nop
+
+skip111:                ; offset 10000
+        jmp poll
+
+
+% c-sdk {
+static inline void eeprom_program_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = eeprom_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, 24);
+    sm_config_set_out_pins(&c, 15, 8);
+    // Set all pin directions to input (false)
+    pio_sm_set_consecutive_pindirs(pio, sm, 26, 32, false);
+    // Connect all GPIOs to this PIO block
+    for (uint i=0; i<29; i++) {     // skip last 3 pins
+        if (i >= 23 && i <= 25)
+            continue;               // skip 3 pins with internal use
+        pio_gpio_init(pio, i);
+    }
+    // Load our configuration, and start the program from the beginning
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
